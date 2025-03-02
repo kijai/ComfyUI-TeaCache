@@ -3,6 +3,7 @@ import torch
 
 from torch import Tensor
 from unittest.mock import patch
+from contextlib import nullcontext
 
 from comfy.ldm.flux.layers import timestep_embedding
 from comfy.ldm.lightricks.model import precompute_freqs_cis
@@ -513,11 +514,11 @@ def teacache_wanvideo_forward(
             context = torch.concat([context_clip, context], dim=1)
 
         rel_l1_thresh = self.rel_l1_thresh
-        print(rel_l1_thresh)
         
         if not hasattr(self, 'accumulated_rel_l1_distance'):
             should_calc = True
             self.accumulated_rel_l1_distance = 0
+            self.teacache_skipped_steps = 0
             print("TeaCache: Initializing TeaCache variables")
         else:
             temb_relative_l1 = relative_l1_distance(self.previous_modulated_input, e0)
@@ -536,7 +537,8 @@ def teacache_wanvideo_forward(
 
         if not should_calc:
             x += self.previous_residual
-            print(f"TeaCache: Skipping step")
+            self.teacache_skipped_steps += 1
+            #print(f"TeaCache: Skipping step")
 
         if should_calc:
             original_x = x.clone()
@@ -612,7 +614,9 @@ class TeaCacheForVidGen:
             "required": {
                 "model": ("MODEL", {"tooltip": "The video diffusion model the TeaCache will be applied to."}),
                 "model_type": (["hunyuan_video", "ltxv", "wan_video"],),
-                "rel_l1_thresh": ("FLOAT", {"default": 0.15, "min": 0.0, "max": 10.0, "step": 0.01, "tooltip": "How strongly to cache the output of diffusion model. This value must be non-negative."})
+                "rel_l1_thresh": ("FLOAT", {"default": 0.15, "min": 0.0, "max": 10.0, "step": 0.001, "tooltip": "How strongly to cache the output of diffusion model. This value must be non-negative."}),
+                "start_percent": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "The start percentage of the steps to use with TeaCache."}),
+                "end_percent": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "The end percentage of the steps to use with TeaCache."})
             }
         }
     
@@ -622,7 +626,7 @@ class TeaCacheForVidGen:
     CATEGORY = "TeaCache"
     TITLE = "TeaCache For Vid Gen"
     
-    def apply_teacache(self, model, model_type: str, rel_l1_thresh: float):
+    def apply_teacache(self, model, model_type: str, rel_l1_thresh: float, start_percent: float, end_percent: float):
         if rel_l1_thresh == 0:
             return (model,)
 
@@ -632,6 +636,7 @@ class TeaCacheForVidGen:
         new_model.model_options["transformer_options"]["rel_l1_thresh"] = rel_l1_thresh
         diffusion_model = new_model.get_model_object("diffusion_model")
         diffusion_model.rel_l1_thresh = rel_l1_thresh
+        diffusion_model.teacache_skipped_steps = 0
 
         if model_type == "hunyuan_video":
             forward_name = "forward_orig"
@@ -653,15 +658,37 @@ class TeaCacheForVidGen:
             )
         else:
             raise ValueError(f"Unknown type {model_type}")
-        
-        def unet_wrapper_function(model_function, kwargs):
-            input = kwargs["input"]
-            timestep = kwargs["timestep"]
-            c = kwargs["c"]
-            with patch.object(diffusion_model, forward_name, replaced_forward_fn):
-                return model_function(input, timestep, **c)
+                
+        def outer_wrapper(start_percent, end_percent):        
+            def unet_wrapper_function(model_function, kwargs):
+                input = kwargs["input"]
+                timestep = kwargs["timestep"]
+                c = kwargs["c"]
+                sigmas = c["transformer_options"]["sample_sigmas"]
+                last_step = len(sigmas) - 2          
+             
+                matched_step_index = (sigmas == timestep[0] ).nonzero()
+                if len(matched_step_index) > 0:
+                    current_step_index = matched_step_index.item()
+                else:
+                    for i in range(len(sigmas) - 1):
+                        # walk from beginning of steps until crossing the timestep
+                        if (sigmas[i] - timestep) * (sigmas[i + 1] - timestep) <= 0:
+                            current_step_index = i
+                            break
+                    else:
+                        current_step_index = 0
+                current_percent = current_step_index / (len(sigmas) - 1)
+                context = patch.object(diffusion_model, forward_name, replaced_forward_fn) if start_percent <= current_percent <= end_percent else nullcontext()
+                with context:
+                    out = model_function(input, timestep, **c)
+                    #print(f"TeaCache current step: {current_step_index} out of {last_step}")
+                    if current_step_index == last_step:
+                        print(f"TeaCache skipped {diffusion_model.teacache_skipped_steps} steps out of {last_step+1}")
+                    return out
+            return unet_wrapper_function
 
-        new_model.set_model_unet_function_wrapper(unet_wrapper_function)
+        new_model.set_model_unet_function_wrapper(outer_wrapper(start_percent=start_percent, end_percent=end_percent))
 
         return (new_model,)
     
