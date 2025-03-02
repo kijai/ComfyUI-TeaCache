@@ -7,6 +7,7 @@ from unittest.mock import patch
 from comfy.ldm.flux.layers import timestep_embedding
 from comfy.ldm.lightricks.model import precompute_freqs_cis
 from comfy.ldm.common_dit import rms_norm
+from comfy.ldm.wan.model import sinusoidal_embedding_1d
 
 
 def poly1d(coefficients, x):
@@ -14,6 +15,12 @@ def poly1d(coefficients, x):
     for i, coeff in enumerate(coefficients):
         result += coeff * (x ** (len(coefficients) - 1 - i))
     return result
+
+def relative_l1_distance(last_tensor, current_tensor):
+    l1_distance = torch.abs(last_tensor - current_tensor).mean()
+    norm = torch.abs(last_tensor).mean()
+    relative_l1_distance = l1_distance / norm
+    return relative_l1_distance.to(torch.float32)
 
 def teacache_flux_forward(
         self,
@@ -456,6 +463,101 @@ def teacache_ltxvmodel_forward(
         # print("res", x)
         return x
 
+
+
+def teacache_wanvideo_forward(
+        self,
+        x,
+        t,
+        context,
+        clip_fea=None,
+        freqs=None,
+    ):
+        r"""
+        Forward pass through the diffusion model
+
+        Args:
+            x (Tensor):
+                List of input video tensors with shape [B, C_in, F, H, W]
+            t (Tensor):
+                Diffusion timesteps tensor of shape [B]
+            context (List[Tensor]):
+                List of text embeddings each with shape [B, L, C]
+            seq_len (`int`):
+                Maximum sequence length for positional encoding
+            clip_fea (Tensor, *optional*):
+                CLIP image features for image-to-video mode
+            y (List[Tensor], *optional*):
+                Conditional video inputs for image-to-video mode, same shape as x
+
+        Returns:
+            List[Tensor]:
+                List of denoised video tensors with original input shapes [C_out, F, H / 8, W / 8]
+        """
+        
+        # embeddings
+        x = self.patch_embedding(x.float()).to(x.dtype)
+        grid_sizes = x.shape[2:]
+        x = x.flatten(2).transpose(1, 2)
+
+        # time embeddings
+        e = self.time_embedding(
+            sinusoidal_embedding_1d(self.freq_dim, t).to(dtype=x[0].dtype))
+        e0 = self.time_projection(e).unflatten(1, (6, self.dim))
+
+        # context
+        context = self.text_embedding(context)
+
+        if clip_fea is not None and self.img_emb is not None:
+            context_clip = self.img_emb(clip_fea)  # bs x 257 x dim
+            context = torch.concat([context_clip, context], dim=1)
+
+        rel_l1_thresh = self.rel_l1_thresh
+        print(rel_l1_thresh)
+        
+        if not hasattr(self, 'accumulated_rel_l1_distance'):
+            should_calc = True
+            self.accumulated_rel_l1_distance = 0
+            print("TeaCache: Initializing TeaCache variables")
+        else:
+            temb_relative_l1 = relative_l1_distance(self.previous_modulated_input, e0)
+            self.accumulated_rel_l1_distance += temb_relative_l1
+            try:
+                if self.accumulated_rel_l1_distance < rel_l1_thresh:
+                    should_calc = False
+                else:
+                    should_calc = True
+                    self.accumulated_rel_l1_distance = 0
+            except:
+                should_calc = True
+                self.accumulated_rel_l1_distance = 0
+
+        self.previous_modulated_input = e0.clone()
+
+        if not should_calc:
+            x += self.previous_residual
+            print(f"TeaCache: Skipping step")
+
+        if should_calc:
+            original_x = x.clone()
+            # arguments
+            kwargs = dict(
+                e=e0,
+                freqs=freqs,
+                context=context)
+
+            for block in self.blocks:
+                x = block(x, **kwargs)
+
+            self.previous_residual = (x - original_x)
+
+        # head
+        x = self.head(x, e)
+
+        # unpatchify
+        x = self.unpatchify(x, grid_sizes)
+        return x
+
 class TeaCacheForImgGen:
     @classmethod
     def INPUT_TYPES(s):
@@ -509,7 +611,7 @@ class TeaCacheForVidGen:
         return {
             "required": {
                 "model": ("MODEL", {"tooltip": "The video diffusion model the TeaCache will be applied to."}),
-                "model_type": (["hunyuan_video", "ltxv"],),
+                "model_type": (["hunyuan_video", "ltxv", "wan_video"],),
                 "rel_l1_thresh": ("FLOAT", {"default": 0.15, "min": 0.0, "max": 10.0, "step": 0.01, "tooltip": "How strongly to cache the output of diffusion model. This value must be non-negative."})
             }
         }
@@ -529,6 +631,7 @@ class TeaCacheForVidGen:
             new_model.model_options['transformer_options'] = {}
         new_model.model_options["transformer_options"]["rel_l1_thresh"] = rel_l1_thresh
         diffusion_model = new_model.get_model_object("diffusion_model")
+        diffusion_model.rel_l1_thresh = rel_l1_thresh
 
         if model_type == "hunyuan_video":
             forward_name = "forward_orig"
@@ -542,6 +645,12 @@ class TeaCacheForVidGen:
                                 diffusion_model,
                                 diffusion_model.__class__
                             )
+        elif model_type == "wan_video":
+            forward_name = "forward_orig"
+            replaced_forward_fn = teacache_wanvideo_forward.__get__(
+                                diffusion_model,
+                                diffusion_model.__class__
+            )
         else:
             raise ValueError(f"Unknown type {model_type}")
         
