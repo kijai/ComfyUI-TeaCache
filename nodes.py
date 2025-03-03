@@ -1,5 +1,6 @@
 import math
 import torch
+import logging
 
 from torch import Tensor
 from unittest.mock import patch
@@ -518,8 +519,9 @@ def teacache_wanvideo_forward(
         if not hasattr(self, 'accumulated_rel_l1_distance'):
             should_calc = True
             self.accumulated_rel_l1_distance = 0
-            self.teacache_skipped_steps = 0
-            print("TeaCache: Initializing TeaCache variables")
+            if self.cond_or_uncond[0] == 0:
+                self.teacache_skipped_steps = 0
+            logging.info("TeaCache: Initialized")
         else:
             temb_relative_l1 = relative_l1_distance(self.previous_modulated_input, e0)
             self.accumulated_rel_l1_distance += temb_relative_l1
@@ -665,7 +667,10 @@ class TeaCacheForVidGen:
                 timestep = kwargs["timestep"]
                 c = kwargs["c"]
                 sigmas = c["transformer_options"]["sample_sigmas"]
-                last_step = len(sigmas) - 2          
+                cond_or_uncond = kwargs["cond_or_uncond"]
+                if cond_or_uncond[0] == 1:
+                    self.has_cfg = True
+                last_step = (len(sigmas) - 1)
              
                 matched_step_index = (sigmas == timestep[0] ).nonzero()
                 if len(matched_step_index) > 0:
@@ -682,9 +687,16 @@ class TeaCacheForVidGen:
                 context = patch.object(diffusion_model, forward_name, replaced_forward_fn) if start_percent <= current_percent <= end_percent else nullcontext()
                 with context:
                     out = model_function(input, timestep, **c)
-                    #print(f"TeaCache current step: {current_step_index} out of {last_step}")
-                    if current_step_index == last_step:
-                        print(f"TeaCache skipped {diffusion_model.teacache_skipped_steps} steps out of {last_step+1}")
+                    #logging.info(f"TeaCache current step: {current_step_index+1}/{last_step}")
+                    if current_step_index+1 == last_step and hasattr(diffusion_model, "teacache_skipped_steps"):
+                        if cond_or_uncond[0] == 0:
+                            skipped_steps = diffusion_model.teacache_skipped_steps
+                            if self.has_cfg:
+                                skipped_steps = skipped_steps // 2
+                            
+                            logging.info("-----------------------------------")
+                            logging.info(f"TeaCache skipped {skipped_steps} steps out of {last_step}")
+                            logging.info("-----------------------------------")
                     return out
             return unet_wrapper_function
 
