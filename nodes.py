@@ -519,8 +519,6 @@ def teacache_wanvideo_forward(
         if not hasattr(self, 'accumulated_rel_l1_distance'):
             should_calc = True
             self.accumulated_rel_l1_distance = 0
-            if self.cond_or_uncond[0] == 0:
-                self.teacache_skipped_steps = 0
             logging.info("TeaCache: Initialized")
         else:
             temb_relative_l1 = relative_l1_distance(self.previous_modulated_input, e0)
