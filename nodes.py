@@ -10,6 +10,7 @@ from comfy.ldm.flux.layers import timestep_embedding
 from comfy.ldm.lightricks.model import precompute_freqs_cis
 from comfy.ldm.common_dit import rms_norm
 from comfy.ldm.wan.model import sinusoidal_embedding_1d
+import comfy.model_management as mm
 
 
 def poly1d(coefficients, x):
@@ -465,15 +466,34 @@ def teacache_ltxvmodel_forward(
         # print("res", x)
         return x
 
+import comfy
+from einops import repeat
 
+#for now as there doesn't seem to be a way to pass transformer_options to the forward_orig currently
+def teacache_wanvideo_forward(self, x, timestep, context, clip_fea=None, **kwargs):
+        bs, c, t, h, w = x.shape
+        x = comfy.ldm.common_dit.pad_to_patch_size(x, self.patch_size)
+        patch_size = self.patch_size
+        t_len = ((t + (patch_size[0] // 2)) // patch_size[0])
+        h_len = ((h + (patch_size[1] // 2)) // patch_size[1])
+        w_len = ((w + (patch_size[2] // 2)) // patch_size[2])
+        img_ids = torch.zeros((t_len, h_len, w_len, 3), device=x.device, dtype=x.dtype)
+        img_ids[:, :, :, 0] = img_ids[:, :, :, 0] + torch.linspace(0, t_len - 1, steps=t_len, device=x.device, dtype=x.dtype).reshape(-1, 1, 1)
+        img_ids[:, :, :, 1] = img_ids[:, :, :, 1] + torch.linspace(0, h_len - 1, steps=h_len, device=x.device, dtype=x.dtype).reshape(1, -1, 1)
+        img_ids[:, :, :, 2] = img_ids[:, :, :, 2] + torch.linspace(0, w_len - 1, steps=w_len, device=x.device, dtype=x.dtype).reshape(1, 1, -1)
+        img_ids = repeat(img_ids, "t h w c -> b (t h w) c", b=bs)
 
-def teacache_wanvideo_forward(
+        freqs = self.rope_embedder(img_ids).movedim(1, 2)
+        return self.forward_orig(x, timestep, context, clip_fea=clip_fea, freqs=freqs, **kwargs)[:, :, :t, :h, :w]
+    
+def teacache_wanvideo_forward_orig(
         self,
         x,
         t,
         context,
         clip_fea=None,
         freqs=None,
+        **kwargs
     ):
         r"""
         Forward pass through the diffusion model
@@ -496,6 +516,11 @@ def teacache_wanvideo_forward(
             List[Tensor]:
                 List of denoised video tensors with original input shapes [C_out, F, H / 8, W / 8]
         """
+        #print(kwargs)
+        # {'control': None, 'transformer_options': {'rel_l1_thresh': 0.01, 'wrappers': {}, 'callbacks': {}, 'sample_sigmas': tensor([1.0000, 0.9932, 0.9860, 0.9784, 0.9703, 0.9618, 0.9527, 0.9430, 0.9326,
+        # 0.9216, 0.9097, 0.8970, 0.8832, 0.8684, 0.8522, 0.8347, 0.8156, 0.7946,
+        # 0.7714, 0.7458, 0.7173, 0.6854, 0.6494, 0.6085, 0.5616, 0.5074, 0.4439,
+        # 0.3684, 0.2774, 0.1655, 0.0010], device='cuda:0'), 'cond_or_uncond': [1], 'uuids': [UUID('82b5290d-0b9c-41e8-b50c-bf6cac1c45fa')], 'sigmas': tensor([0.9216], device='cuda:0')}}
         
         # embeddings
         x = self.patch_embedding(x.float()).to(x.dtype)
@@ -514,45 +539,60 @@ def teacache_wanvideo_forward(
             context_clip = self.img_emb(clip_fea)  # bs x 257 x dim
             context = torch.concat([context_clip, context], dim=1)
 
-        rel_l1_thresh = self.rel_l1_thresh
-        
-        if not hasattr(self, 'accumulated_rel_l1_distance'):
-            should_calc = True
-            self.accumulated_rel_l1_distance = 0
+        #teacache for cond and uncond separately
+        rel_l1_thresh = kwargs["transformer_options"]["rel_l1_thresh"]
+        cache_device = kwargs["transformer_options"]["teacache_device"]
+        is_cond = True if kwargs["transformer_options"]["cond_or_uncond"] == [0] else False
+
+        should_calc = True
+        suffix = "cond" if is_cond else "uncond"
+
+        # Init cache dict if not exists
+        if not hasattr(self, 'teacache_state'):
+            self.teacache_state = {
+                'cond': {'accumulated_rel_l1_distance': 0, 'prev_input': None, 
+                        'teacache_skipped_steps': 0, 'previous_residual': None},
+                'uncond': {'accumulated_rel_l1_distance': 0, 'prev_input': None,
+                          'teacache_skipped_steps': 0, 'previous_residual': None}
+            }
             logging.info("TeaCache: Initialized")
-        else:
-            temb_relative_l1 = relative_l1_distance(self.previous_modulated_input, e0)
-            self.accumulated_rel_l1_distance += temb_relative_l1
+
+        cache = self.teacache_state[suffix]
+
+        if cache['prev_input'] is not None:
+            temb_relative_l1 = relative_l1_distance(cache['prev_input'], e0)
+            curr_acc_dist = cache['accumulated_rel_l1_distance'] + temb_relative_l1
             try:
-                if self.accumulated_rel_l1_distance < rel_l1_thresh:
+                if curr_acc_dist < rel_l1_thresh:
                     should_calc = False
+                    cache['accumulated_rel_l1_distance'] = curr_acc_dist
                 else:
                     should_calc = True
-                    self.accumulated_rel_l1_distance = 0
+                    cache['accumulated_rel_l1_distance'] = 0
             except:
                 should_calc = True
-                self.accumulated_rel_l1_distance = 0
+                cache['accumulated_rel_l1_distance'] = 0
 
-        self.previous_modulated_input = e0.clone()
+        cache['prev_input'] = e0.clone().detach()
 
         if not should_calc:
-            x += self.previous_residual
-            self.teacache_skipped_steps += 1
-            #print(f"TeaCache: Skipping step")
+            x += cache['previous_residual'].to(x.device)
+            cache['teacache_skipped_steps'] += 1
+            print(f"TeaCache: Skipping {suffix} step")
 
         if should_calc:
-            original_x = x.clone()
+            original_x = x.clone().detach()
             # arguments
-            kwargs = dict(
+            block_wargs = dict(
                 e=e0,
                 freqs=freqs,
                 context=context)
 
             for block in self.blocks:
-                x = block(x, **kwargs)
+                x = block(x, **block_wargs)
 
-            self.previous_residual = (x - original_x)
-
+            cache['previous_residual']  = (x - original_x).to(cache_device)
+          
         # head
         x = self.head(x, e)
 
@@ -616,7 +656,8 @@ class TeaCacheForVidGen:
                 "model_type": (["hunyuan_video", "ltxv", "wan_video"],),
                 "rel_l1_thresh": ("FLOAT", {"default": 0.15, "min": 0.0, "max": 10.0, "step": 0.001, "tooltip": "How strongly to cache the output of diffusion model. This value must be non-negative."}),
                 "start_percent": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "The start percentage of the steps to use with TeaCache."}),
-                "end_percent": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "The end percentage of the steps to use with TeaCache."})
+                "end_percent": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01, "tooltip": "The end percentage of the steps to use with TeaCache."}),
+                "cache_device": (["main_device", "offload_device"], {"default": "offload_device", "tooltip": "Device to cache to"}),
             }
         }
     
@@ -626,17 +667,22 @@ class TeaCacheForVidGen:
     CATEGORY = "TeaCache"
     TITLE = "TeaCache For Vid Gen"
     
-    def apply_teacache(self, model, model_type: str, rel_l1_thresh: float, start_percent: float, end_percent: float):
+    def apply_teacache(self, model, model_type: str, rel_l1_thresh: float, start_percent: float, end_percent: float, cache_device: str):
         if rel_l1_thresh == 0:
             return (model,)
+        
+        if cache_device == "main_device":
+            teacache_device = mm.get_torch_device()
+        else:
+            teacache_device = mm.unet_offload_device()
 
         new_model = model.clone()
         if 'transformer_options' not in new_model.model_options:
             new_model.model_options['transformer_options'] = {}
         new_model.model_options["transformer_options"]["rel_l1_thresh"] = rel_l1_thresh
+        new_model.model_options["transformer_options"]["teacache_device"] = teacache_device
         diffusion_model = new_model.get_model_object("diffusion_model")
-        diffusion_model.rel_l1_thresh = rel_l1_thresh
-        diffusion_model.teacache_skipped_steps = 0
+        #diffusion_model.rel_l1_thresh = rel_l1_thresh
 
         if model_type == "hunyuan_video":
             forward_name = "forward_orig"
@@ -650,14 +696,6 @@ class TeaCacheForVidGen:
                                 diffusion_model,
                                 diffusion_model.__class__
                             )
-        elif model_type == "wan_video":
-            forward_name = "forward_orig"
-            replaced_forward_fn = teacache_wanvideo_forward.__get__(
-                                diffusion_model,
-                                diffusion_model.__class__
-            )
-        else:
-            raise ValueError(f"Unknown type {model_type}")
                 
         def outer_wrapper(start_percent, end_percent):        
             def unet_wrapper_function(model_function, kwargs):
@@ -666,8 +704,6 @@ class TeaCacheForVidGen:
                 c = kwargs["c"]
                 sigmas = c["transformer_options"]["sample_sigmas"]
                 cond_or_uncond = kwargs["cond_or_uncond"]
-                if cond_or_uncond[0] == 1:
-                    self.has_cfg = True
                 last_step = (len(sigmas) - 1)
              
                 matched_step_index = (sigmas == timestep[0] ).nonzero()
@@ -681,19 +717,38 @@ class TeaCacheForVidGen:
                             break
                     else:
                         current_step_index = 0
+
+                if current_step_index == 0:
+                    if hasattr(diffusion_model, "teacache_state"):
+                        delattr(diffusion_model, "teacache_state")
+                        logging.info("Resetting TeaCache state")
+                
                 current_percent = current_step_index / (len(sigmas) - 1)
-                context = patch.object(diffusion_model, forward_name, replaced_forward_fn) if start_percent <= current_percent <= end_percent else nullcontext()
+                if start_percent <= current_percent <= end_percent:
+                    c["transformer_options"]["teacache_enabled"] = True
+                    if model_type == "wan_video":
+                        context = patch.multiple(
+                            diffusion_model, 
+                            forward=teacache_wanvideo_forward.__get__(diffusion_model, diffusion_model.__class__), 
+                            forward_orig=teacache_wanvideo_forward_orig.__get__(diffusion_model, diffusion_model.__class__)
+                        )
+                    else:
+                        c["transformer_options"]["teacache_enabled"] = False
+                        context = patch.object(diffusion_model, forward_name, replaced_forward_fn)
+                else:
+                    context = nullcontext()
                 with context:
                     out = model_function(input, timestep, **c)
-                    #logging.info(f"TeaCache current step: {current_step_index+1}/{last_step}")
-                    if current_step_index+1 == last_step and hasattr(diffusion_model, "teacache_skipped_steps"):
+                    if current_step_index+1 == last_step and hasattr(diffusion_model, "teacache_state"):
                         if cond_or_uncond[0] == 0:
-                            skipped_steps = diffusion_model.teacache_skipped_steps
-                            if self.has_cfg:
-                                skipped_steps = skipped_steps // 2
+                            skipped_steps_cond = diffusion_model.teacache_state["cond"]["teacache_skipped_steps"]
+                            skipped_steps_uncond = diffusion_model.teacache_state["uncond"]["teacache_skipped_steps"]
                             
                             logging.info("-----------------------------------")
-                            logging.info(f"TeaCache skipped {skipped_steps} steps out of {last_step}")
+                            logging.info(f"TeaCache skipped:")
+                            logging.info(f"{skipped_steps_cond} cond steps")
+                            logging.info(f"{skipped_steps_uncond} uncond step")
+                            logging.info(f"out of {last_step} steps")
                             logging.info("-----------------------------------")
                     return out
             return unet_wrapper_function
